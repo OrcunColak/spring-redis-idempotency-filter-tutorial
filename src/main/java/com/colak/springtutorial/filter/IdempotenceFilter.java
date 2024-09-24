@@ -22,7 +22,6 @@ import java.io.PrintWriter;
 import java.io.UnsupportedEncodingException;
 import java.net.URI;
 import java.util.Collections;
-import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
 
@@ -52,40 +51,40 @@ public class IdempotenceFilter extends OncePerRequestFilter {
     }
 
     @Override
-    protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response, FilterChain filterChain)
+    protected void doFilterInternal(HttpServletRequest httpServletRequest, HttpServletResponse httpServletResponse, FilterChain filterChain)
             throws ServletException, IOException {
         log.debug("start IdempotenceFilter");
 
-        String method = request.getMethod();
-        String requestId = request.getHeader(REQUEST_ID_KEY);
-        String serviceId = request.getHeader(SERVICE_ID_KEY);
+        String method = httpServletRequest.getMethod();
+        String requestId = httpServletRequest.getHeader(REQUEST_ID_KEY);
+        String serviceId = httpServletRequest.getHeader(SERVICE_ID_KEY);
 
         // GET_/api/v1/orders_2_1
         String cacheKey = join(DELIMITER,
-                method, request.getRequestURI(), serviceId, requestId);
+                method, httpServletRequest.getRequestURI(), serviceId, requestId);
 
         if (isNotTargetMethod(method)) {
             log.info("Request method {} didn't match the target idempotency https method.", method);
-            filterChain.doFilter(request, response);
+            filterChain.doFilter(httpServletRequest, httpServletResponse);
         } else if (StringUtils.isBlank(requestId)
                    || StringUtils.isBlank(serviceId)) {
-            log.warn("Request should bring a RequestId and ServiceId in header, but no. get cacheKey as {}.", cacheKey);
-            filterChain.doFilter(request, response);
+            log.warn("Request should bring a RequestId and ClientId in header, but no. get rid = {}, sid = {}.", requestId, serviceId);
+            filterChain.doFilter(httpServletRequest, httpServletResponse);
         } else {
             log.info("requestId and serviceId not empty, rid = {}, sid = {}", requestId, serviceId);
             BoundValueOperations<String, IdempotencyValue> keyOperation = redisTemplate.boundValueOps(cacheKey);
             boolean isAbsent = Boolean.TRUE.equals(keyOperation.setIfAbsent(IdempotencyValue.init(), ttl, TimeUnit.MINUTES));
             if (isAbsent) {
                 log.info("cache {} does not exist ", cacheKey);
-                ContentCachingResponseWrapper responseCopier = new ContentCachingResponseWrapper(response);
+                ContentCachingResponseWrapper responseCopier = new ContentCachingResponseWrapper(httpServletResponse);
 
-                filterChain.doFilter(request, responseCopier);
+                filterChain.doFilter(httpServletRequest, responseCopier);
 
-                updateResultInCache(request, responseCopier, keyOperation);
+                updateResultInCache(httpServletRequest, responseCopier, keyOperation);
                 responseCopier.copyBodyToResponse();
             } else {
                 log.info("cache {} exists ", cacheKey);
-                handleWhenCacheExist(request, response, keyOperation);
+                handleWhenCacheExist(httpServletRequest, httpServletResponse, keyOperation);
             }
         }
     }
@@ -94,13 +93,15 @@ public class IdempotenceFilter extends OncePerRequestFilter {
         return !HttpMethod.GET.matches(method);
     }
 
-    private void updateResultInCache(HttpServletRequest request, ContentCachingResponseWrapper responseCopier,
+    private void updateResultInCache(HttpServletRequest httpServletRequest, ContentCachingResponseWrapper responseCopier,
                                      BoundValueOperations<String, IdempotencyValue> keyOperation)
             throws UnsupportedEncodingException {
         if (needCache(responseCopier)) {
             log.info("result needs to be cached");
-            String responseBody = new String(responseCopier.getContentAsByteArray(), request.getCharacterEncoding());
-            Map<String, String> headersMap = getHeadersMap(responseCopier);
+            String responseBody = ResponseWrapperUtil.getResponseBody(responseCopier, httpServletRequest);
+            Map<String, String> headersMap = ResponseWrapperUtil.getHeadersMap(responseCopier);
+
+            // Create result to be cached
             IdempotencyValue result = IdempotencyValue.done(headersMap, responseCopier.getStatus(), responseBody);
 
             log.info("save {} to redis", result);
@@ -111,20 +112,7 @@ public class IdempotenceFilter extends OncePerRequestFilter {
         }
     }
 
-    private Map<String, String> getHeadersMap(ContentCachingResponseWrapper responseWrapper) {
-        Map<String, String> headersMap = new HashMap<>();
-
-        // Iterate over all header names
-        for (String headerName : responseWrapper.getHeaderNames()) {
-            // Get the value for each header
-            String headerValue = responseWrapper.getHeader(headerName);
-            headersMap.put(headerName, headerValue);
-        }
-
-        return headersMap;
-    }
-
-    private void handleWhenCacheExist(HttpServletRequest request, HttpServletResponse response,
+    private void handleWhenCacheExist(HttpServletRequest httpServletRequest, HttpServletResponse httpServletResponse,
                                       BoundValueOperations<String, IdempotencyValue> keyOperation)
             throws IOException {
         IdempotencyValue cachedResponse = keyOperation.get();
@@ -143,17 +131,17 @@ public class IdempotenceFilter extends OncePerRequestFilter {
             log.info("cache exist, and is still in processing, please retry later");
             status = TOO_EARLY.value();
             ProblemDetail pd = ProblemDetail.forStatus(TOO_EARLY);
-            pd.setType(URI.create(request.getRequestURI()));
+            pd.setType(URI.create(httpServletRequest.getRequestURI()));
             pd.setDetail("request is now processing, please try again later");
             responseBody = OBJECT_MAPPER.writeValueAsString(pd);
         }
-        response.setStatus(status);
-        response.setContentType(MediaType.APPLICATION_JSON_VALUE);
+        httpServletResponse.setStatus(status);
+        httpServletResponse.setContentType(MediaType.APPLICATION_JSON_VALUE);
 
-        PrintWriter responseWriter = response.getWriter();
+        PrintWriter responseWriter = httpServletResponse.getWriter();
         responseWriter.write(responseBody);
 
-        response.flushBuffer();
+        httpServletResponse.flushBuffer();
 
     }
 
@@ -172,7 +160,5 @@ public class IdempotenceFilter extends OncePerRequestFilter {
         private static IdempotencyValue done(Map<String, String> header, Integer status, String cacheValue) {
             return new IdempotencyValue(header, status, cacheValue, true);
         }
-
     }
-
 }
